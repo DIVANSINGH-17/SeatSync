@@ -1,0 +1,256 @@
+import request from 'supertest';
+import express from 'express';
+import { json } from 'express';
+import 'express-async-errors';
+import { pool } from '../../src/db';
+import { redis, KEYS } from '../../src/redis/client';
+import { v4 as uuidv4 } from 'uuid';
+
+import authRoutes from '../../src/routes/auth';
+import eventRoutes from '../../src/routes/events';
+import bookingRoutes from '../../src/routes/bookings';
+import paymentRoutes from '../../src/routes/payments';
+import adminRoutes from '../../src/routes/admin';
+import { errorHandler } from '../../src/middleware/requestLogger';
+import { eventService } from '../../src/services/event/eventService';
+import { bookingService } from '../../src/services/booking/bookingService';
+import { paymentService } from '../../src/services/payment/paymentService';
+
+jest.mock('../../src/services/websocket/wsService', () => ({
+  broadcastSeatUpdate: jest.fn(),
+  broadcastInventoryUpdate: jest.fn(),
+  notifyWaitlistOffer: jest.fn(),
+  notifySeatAvailable: jest.fn(),
+  isUserOnline: jest.fn().mockResolvedValue(true),
+}));
+
+const app = express();
+app.use(json());
+app.use('/api/auth', authRoutes);
+app.use('/api/events', eventRoutes);
+app.use('/api/bookings', bookingRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/admin', adminRoutes);
+app.use(errorHandler);
+
+let userToken: string;
+let userId: string;
+let idemUserId: string | undefined;
+let testEventId: string;
+let testSeatIds: string[];
+const userEmail = `e2e-user-${uuidv4()}@test.com`;
+
+beforeAll(async () => {
+  const userReg = await request(app)
+    .post('/api/auth/register')
+    .send({ email: userEmail, password: 'password123', name: 'E2E User' });
+  expect(userReg.status).toBe(201);
+  userToken = userReg.body.accessToken;
+  userId = userReg.body.user.id;
+
+  const event = await eventService.createEvent({
+    name: 'E2E Test Event',
+    venue: 'Test Venue',
+    total_seats: 4,
+    base_price: 50,
+    starts_at: new Date(Date.now() + 86400000).toISOString(),
+    ends_at: new Date(Date.now() + 90000000).toISOString(),
+  });
+  testEventId = event.id;
+  const seats = await eventService.getSeatsForEvent(testEventId) as Array<{ id: string }>;
+  testSeatIds = seats.map((s) => s.id);
+});
+
+afterAll(async () => {
+  await pool.query(`DELETE FROM booking_audit_log WHERE booking_id IN (SELECT id FROM bookings WHERE event_id = $1)`, [testEventId]);
+  await pool.query(`DELETE FROM bookings WHERE event_id = $1`, [testEventId]);
+  await pool.query(`DELETE FROM seats WHERE event_id = $1`, [testEventId]);
+  await pool.query(`DELETE FROM events WHERE id = $1`, [testEventId]);
+  await pool.query(`DELETE FROM refresh_tokens WHERE user_id = ANY($1)`, [[userId, idemUserId]]);
+  await pool.query(`DELETE FROM users WHERE email = $1 OR id = $2`, [userEmail, idemUserId ?? null]);
+  await redis.del(KEYS.seatInventory(testEventId));
+  await redis.del(KEYS.waitingQueue(testEventId));
+  await pool.end();
+  await redis.quit();
+});
+
+describe('E2E — happy path: reserve → confirm', () => {
+  it('POST /api/bookings creates a pending booking', async () => {
+    const res = await request(app)
+      .post('/api/bookings')
+      .set('Authorization', `Bearer ${userToken}`)
+      .set('Idempotency-Key', `e2e-happy-${uuidv4()}`)
+      .send({ event_id: testEventId, seat_id: testSeatIds[0] });
+
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('pending');
+    expect(res.body.booking_id).toBeTruthy();
+    expect(res.body.amount).toBeGreaterThan(0);
+  });
+
+  it('GET /api/bookings returns the booking in history', async () => {
+    const res = await request(app)
+      .get('/api/bookings')
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.bookings.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('confirm booking moves seat to booked', async () => {
+    const bookings = await pool.query(
+      `SELECT id FROM bookings WHERE event_id = $1 AND status = 'pending' LIMIT 1`,
+      [testEventId]
+    );
+    const bookingId = bookings.rows[0]?.id;
+    if (!bookingId) return;
+
+    await bookingService.confirmBooking(bookingId, `sim_${uuidv4()}`);
+
+    const seat = await pool.query(
+      `SELECT s.status FROM seats s JOIN bookings b ON b.seat_id = s.id WHERE b.id = $1`,
+      [bookingId]
+    );
+    expect(seat.rows[0].status).toBe('booked');
+
+    const booking = await pool.query(`SELECT status FROM bookings WHERE id = $1`, [bookingId]);
+    expect(booking.rows[0].status).toBe('confirmed');
+  });
+});
+
+describe('E2E — simulated payment failure releases seat', () => {
+  it('failed payment marks booking compensated and frees the seat', async () => {
+    const res = await request(app)
+      .post('/api/bookings')
+      .set('Authorization', `Bearer ${userToken}`)
+      .set('Idempotency-Key', `e2e-fail-${uuidv4()}`)
+      .send({ event_id: testEventId, seat_id: testSeatIds[1] });
+
+    expect(res.status).toBe(201);
+    const bookingId = res.body.booking_id;
+
+    await paymentService.simulatePayment(bookingId, userId, false);
+
+    const booking = await pool.query(`SELECT status FROM bookings WHERE id = $1`, [bookingId]);
+    expect(booking.rows[0].status).toBe('compensated');
+
+    const seat = await pool.query(
+      `SELECT s.status FROM seats s JOIN bookings b ON b.seat_id = s.id WHERE b.id = $1`,
+      [bookingId]
+    );
+    expect(seat.rows[0].status).toBe('available');
+
+    const auditLog = await pool.query(
+      `SELECT new_status FROM booking_audit_log WHERE booking_id = $1 AND new_status = 'compensated'`,
+      [bookingId]
+    );
+    expect(auditLog.rows.length).toBe(1);
+  });
+});
+
+describe('E2E — concurrent storm: zero double-bookings', () => {
+  it('20 concurrent requests for 1 seat produce exactly 1 pending booking', async () => {
+    const seatId = testSeatIds[2];
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 20 }, () =>
+        request(app)
+          .post('/api/bookings')
+          .set('Authorization', `Bearer ${userToken}`)
+          .set('Idempotency-Key', `storm-${uuidv4()}`)
+          .send({ event_id: testEventId, seat_id: seatId })
+      )
+    );
+
+    const bookings201 = results.filter(
+      (r) => r.status === 'fulfilled' && r.value.status === 201
+    );
+    const bookings202 = results.filter(
+      (r) => r.status === 'fulfilled' && r.value.status === 202
+    );
+
+    expect(bookings201.length).toBe(1);
+    expect(bookings201.length + bookings202.length).toBeLessThanOrEqual(20);
+
+    const dbCount = await pool.query(
+      `SELECT COUNT(*) AS c FROM bookings WHERE seat_id = $1 AND status = 'pending'`,
+      [seatId]
+    );
+    expect(parseInt(dbCount.rows[0].c)).toBe(1);
+  });
+});
+
+describe('E2E — idempotency: retry safety', () => {
+  it('same Idempotency-Key returns identical response without duplicate DB row', async () => {
+    const idempKey = `e2e-idem-${uuidv4()}`;
+    const seatId = testSeatIds[3];
+
+    // Fresh user, since the storm test used up the main user's booking rate limit
+    const reg = await request(app)
+      .post('/api/auth/register')
+      .send({ email: `e2e-idem-${uuidv4()}@test.com`, password: 'Password123!', name: 'Idem User' });
+    const token = reg.body.accessToken;
+    idemUserId = reg.body.user.id;
+
+    const [r1, r2] = await Promise.all([
+      request(app)
+        .post('/api/bookings')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', idempKey)
+        .send({ event_id: testEventId, seat_id: seatId }),
+      new Promise<request.Response>((resolve) =>
+        setTimeout(() =>
+          request(app)
+            .post('/api/bookings')
+            .set('Authorization', `Bearer ${token}`)
+            .set('Idempotency-Key', idempKey)
+            .send({ event_id: testEventId, seat_id: seatId })
+            .then(resolve), 50)
+      ),
+    ]);
+
+    expect(r1.status).toBe(201);
+    expect(r2.body.booking_id).toBe(r1.body.booking_id);
+
+    const dupes = await pool.query(
+      `SELECT COUNT(*) AS c FROM bookings WHERE idempotency_key = $1`,
+      [`${idemUserId}:${idempKey}`]
+    );
+    expect(parseInt(dupes.rows[0].c)).toBe(1);
+  });
+});
+
+describe('E2E — refresh token rotation', () => {
+  it('refresh token issues new access token and rotates the refresh token', async () => {
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ email: userEmail, password: 'password123' });
+
+    const refreshToken = loginRes.body.refreshToken;
+    expect(refreshToken).toBeTruthy();
+
+    const refreshRes = await request(app)
+      .post('/api/auth/refresh')
+      .send({ refreshToken });
+
+    expect(refreshRes.status).toBe(200);
+    expect(refreshRes.body.accessToken).toBeTruthy();
+    expect(refreshRes.body.refreshToken).toBeTruthy();
+    expect(refreshRes.body.refreshToken).not.toBe(refreshToken);
+  });
+
+  it('reusing a rotated token returns 401', async () => {
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ email: userEmail, password: 'password123' });
+    const oldToken = loginRes.body.refreshToken;
+
+    await request(app).post('/api/auth/refresh').send({ refreshToken: oldToken });
+
+    const reuseRes = await request(app)
+      .post('/api/auth/refresh')
+      .send({ refreshToken: oldToken });
+
+    expect(reuseRes.status).toBe(401);
+  });
+});

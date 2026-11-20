@@ -1,0 +1,118 @@
+EVENT_ID=b8d7380b-a864-4146-99fd-3b75a8a1d29f
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+
+     execution: local
+        script: scripts/load-test.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 100 max VUs, 1m5s max duration (incl. graceful stop):
+              * concurrency_test: Up to 100 looping VUs for 35s over 3 stages (gracefulRampDown: 30s, gracefulStop: 30s)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  █ THRESHOLDS 
+
+    http_req_duration
+    ✓ 'p(99)<2000' p(99)=22.36ms
+
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+    status_5xx
+    ✓ 'count==0' count=0
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 47973   1082.487778/s
+    checks_succeeded...: 100.00% 47973 out of 47973
+    checks_failed......: 0.00%   0 out of 47973
+
+    ✓ no server error
+
+    CUSTOM
+    booking_duration_ms............: avg=6.968607 min=1       med=6      max=43       p(90)=10      p(95)=12     
+    status_201_booked..............: 50    1.128226/s
+    status_202_queued..............: 47746 1077.365631/s
+    status_409_seat_taken..........: 177   3.99392/s
+    status_5xx.....................: 0     0/s
+
+    HTTP
+    http_req_duration..............: avg=7.13ms   min=1.04ms  med=6.24ms max=227.92ms p(90)=9.48ms  p(95)=11.98ms
+      { expected_response:true }...: avg=7.13ms   min=1.04ms  med=6.24ms max=227.92ms p(90)=9.48ms  p(95)=11.98ms
+    http_req_failed................: 0.00% 0 out of 48024
+    http_reqs......................: 48024 1083.638568/s
+
+    EXECUTION
+    iteration_duration.............: avg=57.33ms  min=51.37ms med=56.6ms max=92.6ms   p(90)=59.89ms p(95)=62.26ms
+    iterations.....................: 47973 1082.487778/s
+    vus............................: 7     min=0          max=100
+    vus_max........................: 100   min=100        max=100
+
+    NETWORK
+    data_received..................: 66 MB 1.5 MB/s
+    data_sent......................: 27 MB 619 kB/s
+
+
+
+
+--- DB double-booking check ---
+ seat_id | count 
+---------+-------
+(0 rows)
+
+ active_bookings 
+-----------------
+              50
+(1 row)
+
